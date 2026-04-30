@@ -1,0 +1,967 @@
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from threading import Lock
+from typing import Any
+
+import pandas as pd
+from pyspark.sql import Row
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType
+
+from idc_app.config import CATALOG, SCHEMA, TABLES
+from idc_app.spark import get_spark
+
+from .pipeline.models import normalize_company_name
+from .settings import settings
+
+PIPELINE_SETTINGS_TABLE = f"{CATALOG}.{SCHEMA}.pipeline_settings"
+GENERATION_RUNS_TABLE = f"{CATALOG}.{SCHEMA}.generation_runs"
+KNOWLEDGE_BASE_DOCUMENTS_TABLE = f"{CATALOG}.{SCHEMA}.knowledge_base_documents"
+CHAT_NOTES_TABLE = f"{CATALOG}.{SCHEMA}.cluster_chat_notes"
+SALES_CLAIMS_TABLE = f"{CATALOG}.{SCHEMA}.sales_claims"
+SALES_DRAFTS_TABLE = f"{CATALOG}.{SCHEMA}.salesforce_drafts"
+SALES_DRAFT_MESSAGES_TABLE = f"{CATALOG}.{SCHEMA}.sales_draft_messages"
+USER_MEMORY_TABLE = f"{CATALOG}.{SCHEMA}.user_memory"
+
+PIPELINE_SETTINGS_SCHEMA = """
+    settings_id STRING,
+    schedule_enabled BOOLEAN,
+    schedule_interval_hours INT,
+    target_region STRING,
+    recency_days INT,
+    dedup_days INT,
+    max_peers INT,
+    max_ownership_nodes INT,
+    generation_runner STRING,
+    databricks_job_id BIGINT,
+    openai_model STRING,
+    chat_model STRING,
+    provider_name STRING,
+    kb_vector_store_id STRING,
+    kb_max_results INT,
+    kb_cleanup_mode STRING,
+    kb_cleanup_on_sync BOOLEAN,
+    kb_document_retention_days INT,
+    kb_last_synced_at TIMESTAMP,
+    kb_last_error STRING,
+    kb_status STRING,
+    updated_at TIMESTAMP,
+    updated_by STRING,
+    last_successful_run_id STRING,
+    last_successful_run_at TIMESTAMP,
+    next_scheduled_run TIMESTAMP
+"""
+
+GENERATION_RUNS_SCHEMA = """
+    app_run_id STRING,
+    trigger_source STRING,
+    requested_by STRING,
+    research_mode STRING,
+    research_target STRING,
+    target_region STRING,
+    company_name STRING,
+    runner_type STRING,
+    status STRING,
+    requested_at TIMESTAMP,
+    started_at TIMESTAMP,
+    finished_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    created_cluster_id STRING,
+    duplicate_skipped BOOLEAN,
+    error_message STRING,
+    step_statuses_json STRING,
+    databricks_job_id BIGINT,
+    databricks_run_id BIGINT,
+    job_url STRING
+"""
+
+KNOWLEDGE_BASE_DOCUMENTS_SCHEMA = """
+    document_id STRING,
+    cluster_id STRING,
+    document_kind STRING,
+    title STRING,
+    file_path STRING,
+    content_sha STRING,
+    source_run_id STRING,
+    entity_id STRING,
+    source_id STRING,
+    linked_entity_id STRING,
+    attributes_json STRING,
+    vector_store_id STRING,
+    uploaded_file_id STRING,
+    vector_store_file_id STRING,
+    sync_status STRING,
+    synced_at TIMESTAMP,
+    error_message STRING,
+    updated_at TIMESTAMP
+"""
+
+CHAT_NOTES_SCHEMA = """
+    note_id STRING,
+    cluster_id STRING,
+    title STRING,
+    summary_markdown STRING,
+    source_response_id STRING,
+    source_message_count INT,
+    committed_at TIMESTAMP,
+    committed_by STRING,
+    updated_at TIMESTAMP
+"""
+
+SALES_CLAIMS_SCHEMA = """
+    claim_id STRING,
+    cluster_id STRING,
+    sales_item_id STRING,
+    cluster_entity_id STRING,
+    event_subject_company_name STRING,
+    event_headline STRING,
+    subject_company_name STRING,
+    branch_type STRING,
+    entity_type STRING,
+    normalized_company_name STRING,
+    claimed_by_user_id STRING,
+    claimed_by_name STRING,
+    claimed_by_email STRING,
+    claimed_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    status STRING,
+    salesforce_stage STRING,
+    salesforce_record_type STRING,
+    salesforce_record_id STRING,
+    salesforce_owner_name STRING,
+    salesforce_owner_id STRING,
+    salesforce_account_name STRING,
+    salesforce_account_id STRING,
+    salesforce_contact_count INT,
+    salesforce_open_opportunity_count INT,
+    last_activity_note STRING,
+    last_activity_at TIMESTAMP,
+    last_pushed_at TIMESTAMP,
+    next_step STRING,
+    draft_id STRING
+"""
+
+SALES_DRAFTS_SCHEMA = """
+    draft_id STRING,
+    claim_id STRING,
+    cluster_id STRING,
+    sales_item_id STRING,
+    draft_payload_json STRING,
+    draft_status STRING,
+    last_generated_at TIMESTAMP,
+    last_pushed_at TIMESTAMP,
+    pushed_by_name STRING,
+    updated_at TIMESTAMP
+"""
+
+SALES_DRAFT_MESSAGES_SCHEMA = """
+    message_id STRING,
+    draft_id STRING,
+    cluster_id STRING,
+    sales_item_id STRING,
+    role STRING,
+    channel STRING,
+    content STRING,
+    created_at TIMESTAMP
+"""
+
+USER_MEMORY_SCHEMA = """
+    user_id STRING,
+    memory_key STRING,
+    memory_value STRING,
+    updated_at TIMESTAMP
+"""
+
+EVENT_CLUSTER_LOCATION_COLUMNS = {
+    "subject_state": "STRING",
+    "subject_city": "STRING",
+    "subject_address": "STRING",
+    "subject_latitude": "DOUBLE",
+    "subject_longitude": "DOUBLE",
+}
+
+ENTITY_LOCATION_COLUMNS = {
+    "entity_country": "STRING",
+    "entity_region": "STRING",
+    "entity_state": "STRING",
+    "entity_city": "STRING",
+    "entity_address": "STRING",
+    "entity_latitude": "DOUBLE",
+    "entity_longitude": "DOUBLE",
+}
+
+TERMINAL_STATUSES = ("succeeded", "failed", "skipped", "cancelled")
+
+_CONTROL_PLANE_TABLES_READY = False
+_CONTROL_PLANE_TABLES_LOCK = Lock()
+_PIPELINE_OUTPUT_TABLES_READY = False
+_PIPELINE_OUTPUT_TABLES_LOCK = Lock()
+
+PIPELINE_SETTINGS_COLUMNS = {
+    "settings_id": "STRING",
+    "schedule_enabled": "BOOLEAN",
+    "schedule_interval_hours": "INT",
+    "target_region": "STRING",
+    "recency_days": "INT",
+    "dedup_days": "INT",
+    "max_peers": "INT",
+    "max_ownership_nodes": "INT",
+    "generation_runner": "STRING",
+    "databricks_job_id": "BIGINT",
+    "openai_model": "STRING",
+    "chat_model": "STRING",
+    "provider_name": "STRING",
+    "kb_vector_store_id": "STRING",
+    "kb_max_results": "INT",
+    "kb_cleanup_mode": "STRING",
+    "kb_cleanup_on_sync": "BOOLEAN",
+    "kb_document_retention_days": "INT",
+    "kb_last_synced_at": "TIMESTAMP",
+    "kb_last_error": "STRING",
+    "kb_status": "STRING",
+    "updated_at": "TIMESTAMP",
+    "updated_by": "STRING",
+    "last_successful_run_id": "STRING",
+    "last_successful_run_at": "TIMESTAMP",
+    "next_scheduled_run": "TIMESTAMP",
+}
+
+KNOWLEDGE_BASE_DOCUMENT_COLUMNS = {
+    "document_id": "STRING",
+    "cluster_id": "STRING",
+    "document_kind": "STRING",
+    "title": "STRING",
+    "file_path": "STRING",
+    "content_sha": "STRING",
+    "source_run_id": "STRING",
+    "entity_id": "STRING",
+    "source_id": "STRING",
+    "linked_entity_id": "STRING",
+    "attributes_json": "STRING",
+    "vector_store_id": "STRING",
+    "uploaded_file_id": "STRING",
+    "vector_store_file_id": "STRING",
+    "sync_status": "STRING",
+    "synced_at": "TIMESTAMP",
+    "error_message": "STRING",
+    "updated_at": "TIMESTAMP",
+}
+
+SALES_CLAIM_COLUMNS = {
+    "claim_id": "STRING",
+    "cluster_id": "STRING",
+    "sales_item_id": "STRING",
+    "cluster_entity_id": "STRING",
+    "event_subject_company_name": "STRING",
+    "event_headline": "STRING",
+    "subject_company_name": "STRING",
+    "branch_type": "STRING",
+    "entity_type": "STRING",
+    "normalized_company_name": "STRING",
+    "claimed_by_user_id": "STRING",
+    "claimed_by_name": "STRING",
+    "claimed_by_email": "STRING",
+    "claimed_at": "TIMESTAMP",
+    "updated_at": "TIMESTAMP",
+    "status": "STRING",
+    "salesforce_stage": "STRING",
+    "salesforce_record_type": "STRING",
+    "salesforce_record_id": "STRING",
+    "salesforce_owner_name": "STRING",
+    "salesforce_owner_id": "STRING",
+    "salesforce_account_name": "STRING",
+    "salesforce_account_id": "STRING",
+    "salesforce_contact_count": "INT",
+    "salesforce_open_opportunity_count": "INT",
+    "last_activity_note": "STRING",
+    "last_activity_at": "TIMESTAMP",
+    "last_pushed_at": "TIMESTAMP",
+    "next_step": "STRING",
+    "draft_id": "STRING",
+}
+
+SALES_DRAFT_COLUMNS = {
+    "draft_id": "STRING",
+    "claim_id": "STRING",
+    "cluster_id": "STRING",
+    "sales_item_id": "STRING",
+    "draft_payload_json": "STRING",
+    "draft_status": "STRING",
+    "last_generated_at": "TIMESTAMP",
+    "last_pushed_at": "TIMESTAMP",
+    "pushed_by_name": "STRING",
+    "updated_at": "TIMESTAMP",
+}
+
+SALES_DRAFT_MESSAGE_COLUMNS = {
+    "message_id": "STRING",
+    "draft_id": "STRING",
+    "cluster_id": "STRING",
+    "sales_item_id": "STRING",
+    "role": "STRING",
+    "channel": "STRING",
+    "content": "STRING",
+    "created_at": "TIMESTAMP",
+}
+
+USER_MEMORY_COLUMNS = {
+    "user_id": "STRING",
+    "memory_key": "STRING",
+    "memory_value": "STRING",
+    "updated_at": "TIMESTAMP",
+}
+
+GENERATION_RUN_COLUMNS = {
+    "app_run_id": "STRING",
+    "trigger_source": "STRING",
+    "requested_by": "STRING",
+    "research_mode": "STRING",
+    "research_target": "STRING",
+    "target_region": "STRING",
+    "company_name": "STRING",
+    "runner_type": "STRING",
+    "status": "STRING",
+    "requested_at": "TIMESTAMP",
+    "started_at": "TIMESTAMP",
+    "finished_at": "TIMESTAMP",
+    "updated_at": "TIMESTAMP",
+    "created_cluster_id": "STRING",
+    "duplicate_skipped": "BOOLEAN",
+    "error_message": "STRING",
+    "step_statuses_json": "STRING",
+    "databricks_job_id": "BIGINT",
+    "databricks_run_id": "BIGINT",
+    "job_url": "STRING",
+}
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _clean_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    if pd.isna(value):
+        return None
+    return value
+
+
+def _normalize_timestamp(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        if value.tzinfo is None:
+            return value.tz_localize("UTC").to_pydatetime()
+        return value.tz_convert("UTC").to_pydatetime()
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _coerce_row_to_schema(row: dict[str, Any], schema: StructType) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for field in schema.fields:
+        value = row.get(field.name)
+        cleaned = _clean_value(value)
+        if field.dataType.typeName() == "timestamp":
+            normalized[field.name] = _normalize_timestamp(cleaned)
+        else:
+            normalized[field.name] = cleaned
+    return normalized
+
+
+def _quote_sql(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _quote_identifier(value: str) -> str:
+    return f"`{value.replace('`', '``')}`"
+
+
+def _quote_table(table_fqn: str) -> str:
+    return ".".join(_quote_identifier(part) for part in table_fqn.split("."))
+
+
+def _ensure_table(table_fqn: str, ddl: str) -> None:
+    spark = get_spark()
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS {CATALOG}.{SCHEMA}")
+    spark.sql(f"CREATE TABLE IF NOT EXISTS {table_fqn} ({ddl}) USING DELTA")
+
+
+def _ensure_columns(table_fqn: str, columns: dict[str, str]) -> None:
+    spark = get_spark()
+    existing = {field.name for field in spark.table(table_fqn).schema.fields}
+    missing = {name: dtype for name, dtype in columns.items() if name not in existing}
+    if not missing:
+        return
+    ddl = ", ".join(f"{name} {dtype}" for name, dtype in missing.items())
+    spark.sql(f"ALTER TABLE {table_fqn} ADD COLUMNS ({ddl})")
+
+
+def ensure_control_plane_tables() -> None:
+    global _CONTROL_PLANE_TABLES_READY
+    with _CONTROL_PLANE_TABLES_LOCK:
+        if _CONTROL_PLANE_TABLES_READY:
+            return
+        _ensure_table(PIPELINE_SETTINGS_TABLE, PIPELINE_SETTINGS_SCHEMA)
+        _ensure_table(GENERATION_RUNS_TABLE, GENERATION_RUNS_SCHEMA)
+        _ensure_table(KNOWLEDGE_BASE_DOCUMENTS_TABLE, KNOWLEDGE_BASE_DOCUMENTS_SCHEMA)
+        _ensure_table(CHAT_NOTES_TABLE, CHAT_NOTES_SCHEMA)
+        _ensure_table(SALES_CLAIMS_TABLE, SALES_CLAIMS_SCHEMA)
+        _ensure_table(SALES_DRAFTS_TABLE, SALES_DRAFTS_SCHEMA)
+        _ensure_table(SALES_DRAFT_MESSAGES_TABLE, SALES_DRAFT_MESSAGES_SCHEMA)
+        _ensure_table(USER_MEMORY_TABLE, USER_MEMORY_SCHEMA)
+        _ensure_columns(PIPELINE_SETTINGS_TABLE, PIPELINE_SETTINGS_COLUMNS)
+        _ensure_columns(GENERATION_RUNS_TABLE, GENERATION_RUN_COLUMNS)
+        _ensure_columns(KNOWLEDGE_BASE_DOCUMENTS_TABLE, KNOWLEDGE_BASE_DOCUMENT_COLUMNS)
+        _ensure_columns(SALES_CLAIMS_TABLE, SALES_CLAIM_COLUMNS)
+        _ensure_columns(SALES_DRAFTS_TABLE, SALES_DRAFT_COLUMNS)
+        _ensure_columns(SALES_DRAFT_MESSAGES_TABLE, SALES_DRAFT_MESSAGE_COLUMNS)
+        _ensure_columns(USER_MEMORY_TABLE, USER_MEMORY_COLUMNS)
+        _CONTROL_PLANE_TABLES_READY = True
+
+
+def ensure_pipeline_output_tables() -> None:
+    global _PIPELINE_OUTPUT_TABLES_READY
+    with _PIPELINE_OUTPUT_TABLES_LOCK:
+        if _PIPELINE_OUTPUT_TABLES_READY:
+            return
+        _ensure_columns(TABLES["event_clusters"], EVENT_CLUSTER_LOCATION_COLUMNS)
+        _ensure_columns(TABLES["cluster_entities"], ENTITY_LOCATION_COLUMNS)
+        _ensure_columns(TABLES["cluster_role_recommendations"], {"hypothesized_services_json": "STRING"})
+        _PIPELINE_OUTPUT_TABLES_READY = True
+
+
+def ensure_pipeline_tables() -> None:
+    ensure_control_plane_tables()
+    ensure_pipeline_output_tables()
+
+
+def _table_append(table_fqn: str, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    spark = get_spark()
+    schema = spark.table(table_fqn).schema
+    normalized_rows = [_coerce_row_to_schema(row, schema) for row in rows]
+    spark.createDataFrame([Row(**row) for row in normalized_rows], schema=schema).write.format("delta").mode("append").saveAsTable(
+        table_fqn
+    )
+
+
+def append_rows(table_fqn: str, rows: list[dict[str, Any]]) -> None:
+    _table_append(table_fqn, rows)
+
+
+def _upsert_rows(table_fqn: str, key_names: list[str], rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+
+    spark = get_spark()
+    schema = spark.table(table_fqn).schema
+    normalized_rows = [_coerce_row_to_schema(row, schema) for row in rows]
+    temp_view = f"idc_upsert_{uuid.uuid4().hex}"
+    source_df = spark.createDataFrame([Row(**row) for row in normalized_rows], schema=schema)
+    source_df.createOrReplaceTempView(temp_view)
+
+    assignments = ", ".join(
+        f"target.{_quote_identifier(field.name)} = source.{_quote_identifier(field.name)}"
+        for field in schema.fields
+    )
+    insert_columns = ", ".join(_quote_identifier(field.name) for field in schema.fields)
+    insert_values = ", ".join(f"source.{_quote_identifier(field.name)}" for field in schema.fields)
+    join_condition = " AND ".join(
+        f"target.{_quote_identifier(key_name)} <=> source.{_quote_identifier(key_name)}"
+        for key_name in key_names
+    )
+
+    try:
+        spark.sql(
+            f"""
+            MERGE INTO {_quote_table(table_fqn)} AS target
+            USING {_quote_identifier(temp_view)} AS source
+            ON {join_condition}
+            WHEN MATCHED THEN UPDATE SET {assignments}
+            WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})
+            """
+        )
+    finally:
+        spark.catalog.dropTempView(temp_view)
+
+
+def build_default_pipeline_settings() -> dict[str, Any]:
+    now = utcnow()
+    interval = 2
+    return {
+        "settings_id": "default",
+        "schedule_enabled": False,
+        "schedule_interval_hours": interval,
+        "target_region": settings.pipeline_target_region,
+        "recency_days": settings.pipeline_recency_days,
+        "dedup_days": settings.pipeline_dedup_days,
+        "max_peers": settings.pipeline_max_peers,
+        "max_ownership_nodes": settings.pipeline_max_ownership_nodes,
+        "generation_runner": settings.resolved_generation_runner,
+        "databricks_job_id": settings.generation_job_id,
+        "openai_model": settings.openai_model,
+        "chat_model": settings.chat_model,
+        "provider_name": "azure_openai",
+        "kb_vector_store_id": settings.kb_vector_store_id,
+        "kb_max_results": settings.kb_max_results,
+        "kb_cleanup_mode": settings.kb_cleanup_mode,
+        "kb_cleanup_on_sync": settings.kb_cleanup_on_sync,
+        "kb_document_retention_days": settings.kb_document_retention_days,
+        "kb_last_synced_at": None,
+        "kb_last_error": None,
+        "kb_status": "not_synced",
+        "updated_at": now,
+        "updated_by": "system",
+        "last_successful_run_id": None,
+        "last_successful_run_at": None,
+        "next_scheduled_run": now + timedelta(hours=interval),
+    }
+
+
+def get_pipeline_settings_record() -> dict[str, Any]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = spark.table(PIPELINE_SETTINGS_TABLE).filter("settings_id = 'default'").limit(1).toPandas()
+    if pdf.empty:
+        record = build_default_pipeline_settings()
+        _table_append(PIPELINE_SETTINGS_TABLE, [record])
+        return record
+    return {key: _clean_value(value) for key, value in pdf.iloc[0].to_dict().items()}
+
+
+def save_pipeline_settings_record(patch: dict[str, Any], updated_by: str = "app") -> dict[str, Any]:
+    current = get_pipeline_settings_record()
+    next_record = {
+        **current,
+        **patch,
+        "settings_id": "default",
+        "updated_at": utcnow(),
+        "updated_by": updated_by,
+    }
+    if next_record.get("schedule_enabled"):
+        interval_hours = int(next_record.get("schedule_interval_hours") or 2)
+        anchor = utcnow()
+        next_record["next_scheduled_run"] = anchor + timedelta(hours=interval_hours)
+    else:
+        next_record["next_scheduled_run"] = None
+    _upsert_rows(PIPELINE_SETTINGS_TABLE, ["settings_id"], [next_record])
+    return next_record
+
+
+def list_generation_run_records(limit: int = 25) -> list[dict[str, Any]]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = spark.table(GENERATION_RUNS_TABLE).orderBy("requested_at", ascending=False).limit(limit).toPandas()
+    return [{key: _clean_value(value) for key, value in row.items()} for row in pdf.to_dict(orient="records")]
+
+
+def get_generation_run_record(app_run_id: str) -> dict[str, Any] | None:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = spark.table(GENERATION_RUNS_TABLE).filter(F.col("app_run_id") == F.lit(app_run_id)).limit(1).toPandas()
+    if pdf.empty:
+        return None
+    return {key: _clean_value(value) for key, value in pdf.iloc[0].to_dict().items()}
+
+
+def save_generation_run_record(record: dict[str, Any]) -> dict[str, Any]:
+    ensure_control_plane_tables()
+    now = utcnow()
+    next_record = {
+        "app_run_id": record["app_run_id"],
+        "trigger_source": record.get("trigger_source", "manual"),
+        "requested_by": record.get("requested_by", "app"),
+        "research_mode": record.get("research_mode"),
+        "research_target": record.get("research_target"),
+        "target_region": record.get("target_region"),
+        "company_name": record.get("company_name"),
+        "runner_type": record.get("runner_type", settings.resolved_generation_runner),
+        "status": record.get("status", "queued"),
+        "requested_at": record.get("requested_at", now),
+        "started_at": record.get("started_at"),
+        "finished_at": record.get("finished_at"),
+        "updated_at": now,
+        "created_cluster_id": record.get("created_cluster_id"),
+        "duplicate_skipped": bool(record.get("duplicate_skipped", False)),
+        "error_message": record.get("error_message"),
+        "step_statuses_json": json.dumps(record.get("step_statuses", {})),
+        "databricks_job_id": record.get("databricks_job_id"),
+        "databricks_run_id": record.get("databricks_run_id"),
+        "job_url": record.get("job_url"),
+    }
+    _upsert_rows(GENERATION_RUNS_TABLE, ["app_run_id"], [next_record])
+    return next_record
+
+
+def update_generation_run_record(app_run_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    current = get_generation_run_record(app_run_id)
+    if current is None:
+        raise KeyError(app_run_id)
+    merged = {
+        **current,
+        **patch,
+        "app_run_id": app_run_id,
+        "step_statuses": patch.get("step_statuses")
+        or json.loads(current.get("step_statuses_json") or "{}"),
+    }
+    saved = save_generation_run_record(merged)
+    if saved["status"] == "succeeded":
+        save_pipeline_settings_record(
+            {
+                "last_successful_run_id": app_run_id,
+                "last_successful_run_at": saved.get("finished_at") or utcnow(),
+            },
+            updated_by="pipeline",
+        )
+    return saved
+
+
+def recent_distinct_values(table_fqn: str, column: str, timestamp_column: str, days: int) -> list[str]:
+    spark = get_spark()
+    cutoff = utcnow() - timedelta(days=days)
+    rows = (
+        spark.table(table_fqn)
+        .filter(F.col(timestamp_column) >= F.lit(cutoff))
+        .select(column)
+        .distinct()
+        .collect()
+    )
+    return [getattr(row, column) for row in rows if getattr(row, column, None)]
+
+
+def list_active_generation_run_records(runner_type: str | None = None) -> list[dict[str, Any]]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    frame = spark.table(GENERATION_RUNS_TABLE).filter(~F.col("status").isin(*TERMINAL_STATUSES))
+    if runner_type:
+        frame = frame.filter(F.col("runner_type") == F.lit(runner_type))
+    pdf = frame.orderBy("requested_at", ascending=False).toPandas()
+    return [{key: _clean_value(value) for key, value in row.items()} for row in pdf.to_dict(orient="records")]
+
+
+def get_kb_document_record(
+    cluster_id: str,
+    *,
+    document_kind: str = "cluster",
+    entity_id: str | None = None,
+    source_id: str | None = None,
+) -> dict[str, Any] | None:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    frame = spark.table(KNOWLEDGE_BASE_DOCUMENTS_TABLE).filter(F.col("cluster_id") == F.lit(cluster_id))
+    frame = frame.filter(F.col("document_kind") == F.lit(document_kind))
+    if entity_id is None:
+        frame = frame.filter(F.col("entity_id").isNull())
+    else:
+        frame = frame.filter(F.col("entity_id") == F.lit(entity_id))
+    if source_id is None:
+        frame = frame.filter(F.col("source_id").isNull())
+    else:
+        frame = frame.filter(F.col("source_id") == F.lit(source_id))
+    pdf = frame.limit(1).toPandas()
+    if pdf.empty:
+        return None
+    return {key: _clean_value(value) for key, value in pdf.iloc[0].to_dict().items()}
+
+
+def list_kb_document_records() -> list[dict[str, Any]]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = spark.table(KNOWLEDGE_BASE_DOCUMENTS_TABLE).orderBy("cluster_id").toPandas()
+    return [{key: _clean_value(value) for key, value in row.items()} for row in pdf.to_dict(orient="records")]
+
+
+def save_kb_document_record(record: dict[str, Any]) -> dict[str, Any]:
+    ensure_control_plane_tables()
+    next_record = {
+        "document_id": record.get("document_id"),
+        "cluster_id": record["cluster_id"],
+        "document_kind": record.get("document_kind", "cluster"),
+        "title": record.get("title"),
+        "file_path": record.get("file_path"),
+        "content_sha": record.get("content_sha"),
+        "source_run_id": record.get("source_run_id"),
+        "entity_id": record.get("entity_id"),
+        "source_id": record.get("source_id"),
+        "linked_entity_id": record.get("linked_entity_id"),
+        "attributes_json": record.get("attributes_json"),
+        "vector_store_id": record.get("vector_store_id"),
+        "uploaded_file_id": record.get("uploaded_file_id"),
+        "vector_store_file_id": record.get("vector_store_file_id"),
+        "sync_status": record.get("sync_status", "pending"),
+        "synced_at": record.get("synced_at"),
+        "error_message": record.get("error_message"),
+        "updated_at": utcnow(),
+    }
+    _upsert_rows(KNOWLEDGE_BASE_DOCUMENTS_TABLE, ["cluster_id", "document_kind", "entity_id", "source_id"], [next_record])
+    return next_record
+
+
+def replace_kb_document_records(records: list[dict[str, Any]]) -> None:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    schema = spark.table(KNOWLEDGE_BASE_DOCUMENTS_TABLE).schema
+    normalized_rows = [_coerce_row_to_schema(record, schema) for record in records]
+    if normalized_rows:
+        dataframe = spark.createDataFrame([Row(**row) for row in normalized_rows], schema=schema)
+        dataframe.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(KNOWLEDGE_BASE_DOCUMENTS_TABLE)
+        return
+    spark.sql(f"TRUNCATE TABLE {_quote_table(KNOWLEDGE_BASE_DOCUMENTS_TABLE)}")
+
+
+def count_kb_document_records(*, include_manifest: bool = False) -> int:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    frame = spark.table(KNOWLEDGE_BASE_DOCUMENTS_TABLE)
+    if not include_manifest:
+        frame = frame.filter(F.col("document_kind") != F.lit("manifest"))
+    return int(frame.count())
+
+
+def list_chat_note_records(cluster_id: str | None = None) -> list[dict[str, Any]]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    frame = spark.table(CHAT_NOTES_TABLE)
+    if cluster_id:
+        frame = frame.filter(F.col("cluster_id") == F.lit(cluster_id))
+    pdf = frame.orderBy(F.col("committed_at").desc()).toPandas()
+    return [{key: _clean_value(value) for key, value in row.items()} for row in pdf.to_dict(orient="records")]
+
+
+def save_chat_note_record(record: dict[str, Any]) -> dict[str, Any]:
+    ensure_control_plane_tables()
+    now = utcnow()
+    next_record = {
+        "note_id": record["note_id"],
+        "cluster_id": record["cluster_id"],
+        "title": record.get("title"),
+        "summary_markdown": record.get("summary_markdown"),
+        "source_response_id": record.get("source_response_id"),
+        "source_message_count": record.get("source_message_count"),
+        "committed_at": record.get("committed_at", now),
+        "committed_by": record.get("committed_by", "app"),
+        "updated_at": now,
+    }
+    _upsert_rows(CHAT_NOTES_TABLE, ["note_id"], [next_record])
+    return next_record
+
+
+def list_sales_claim_records(
+    *,
+    cluster_ids: list[str] | None = None,
+    sales_item_ids: list[str] | None = None,
+    normalized_company_name: str | None = None,
+    claimed_by_user_id: str | None = None,
+    limit: int | None = 200,
+) -> list[dict[str, Any]]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    frame = spark.table(SALES_CLAIMS_TABLE)
+    if cluster_ids:
+        frame = frame.filter(F.col("cluster_id").isin(cluster_ids))
+    if sales_item_ids:
+        frame = frame.filter(F.col("sales_item_id").isin(sales_item_ids))
+    if normalized_company_name:
+        frame = frame.filter(F.col("normalized_company_name") == F.lit(normalized_company_name))
+    if claimed_by_user_id:
+        frame = frame.filter(F.col("claimed_by_user_id") == F.lit(claimed_by_user_id))
+    frame = frame.orderBy(F.col("claimed_at").desc())
+    if limit:
+        frame = frame.limit(limit)
+    pdf = frame.toPandas()
+    return [{key: _clean_value(value) for key, value in row.items()} for row in pdf.to_dict(orient="records")]
+
+
+def get_sales_claim_record(sales_item_id: str) -> dict[str, Any] | None:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = spark.table(SALES_CLAIMS_TABLE).filter(F.col("sales_item_id") == F.lit(sales_item_id)).limit(1).toPandas()
+    if pdf.empty:
+        return None
+    return {key: _clean_value(value) for key, value in pdf.iloc[0].to_dict().items()}
+
+
+def _build_claim_record(record: dict[str, Any], now: datetime) -> dict[str, Any]:
+    return {
+        "claim_id": record["claim_id"],
+        "cluster_id": record["cluster_id"],
+        "sales_item_id": record["sales_item_id"],
+        "cluster_entity_id": record.get("cluster_entity_id"),
+        "event_subject_company_name": record.get("event_subject_company_name"),
+        "event_headline": record.get("event_headline"),
+        "subject_company_name": record.get("subject_company_name"),
+        "branch_type": record.get("branch_type"),
+        "entity_type": record.get("entity_type"),
+        "normalized_company_name": record.get("normalized_company_name")
+        or normalize_company_name(str(record.get("subject_company_name") or "")),
+        "claimed_by_user_id": record.get("claimed_by_user_id"),
+        "claimed_by_name": record.get("claimed_by_name"),
+        "claimed_by_email": record.get("claimed_by_email"),
+        "claimed_at": record.get("claimed_at", now),
+        "updated_at": now,
+        "status": record.get("status", "claimed"),
+        "salesforce_stage": record.get("salesforce_stage", "Claimed"),
+        "salesforce_record_type": record.get("salesforce_record_type", "prospect"),
+        "salesforce_record_id": record.get("salesforce_record_id"),
+        "salesforce_owner_name": record.get("salesforce_owner_name") or record.get("claimed_by_name"),
+        "salesforce_owner_id": record.get("salesforce_owner_id"),
+        "salesforce_account_name": record.get("salesforce_account_name"),
+        "salesforce_account_id": record.get("salesforce_account_id"),
+        "salesforce_contact_count": int(record.get("salesforce_contact_count") or 0),
+        "salesforce_open_opportunity_count": int(record.get("salesforce_open_opportunity_count") or 0),
+        "last_activity_note": record.get("last_activity_note"),
+        "last_activity_at": record.get("last_activity_at"),
+        "last_pushed_at": record.get("last_pushed_at"),
+        "next_step": record.get("next_step"),
+        "draft_id": record.get("draft_id"),
+    }
+
+
+def save_sales_claim_record(record: dict[str, Any]) -> dict[str, Any]:
+    ensure_control_plane_tables()
+    next_record = _build_claim_record(record, utcnow())
+    _upsert_rows(SALES_CLAIMS_TABLE, ["sales_item_id"], [next_record])
+    return next_record
+
+
+def claim_sales_claim_record(record: dict[str, Any]) -> dict[str, Any]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    schema = spark.table(SALES_CLAIMS_TABLE).schema
+    next_record = _build_claim_record(record, utcnow())
+    normalized_row = _coerce_row_to_schema(next_record, schema)
+    temp_view = f"idc_claim_{uuid.uuid4().hex}"
+    source_df = spark.createDataFrame([Row(**normalized_row)], schema=schema)
+    source_df.createOrReplaceTempView(temp_view)
+
+    assignments = ", ".join(
+        f"target.{_quote_identifier(field.name)} = source.{_quote_identifier(field.name)}"
+        for field in schema.fields
+    )
+    insert_columns = ", ".join(_quote_identifier(field.name) for field in schema.fields)
+    insert_values = ", ".join(f"source.{_quote_identifier(field.name)}" for field in schema.fields)
+
+    try:
+        spark.sql(
+            f"""
+            MERGE INTO {_quote_table(SALES_CLAIMS_TABLE)} AS target
+            USING {_quote_identifier(temp_view)} AS source
+            ON target.{_quote_identifier("sales_item_id")} <=> source.{_quote_identifier("sales_item_id")}
+            WHEN MATCHED AND target.{_quote_identifier("claimed_by_user_id")} <=> source.{_quote_identifier("claimed_by_user_id")}
+              THEN UPDATE SET {assignments}
+            WHEN NOT MATCHED THEN
+              INSERT ({insert_columns}) VALUES ({insert_values})
+            """
+        )
+    finally:
+        spark.catalog.dropTempView(temp_view)
+
+    claimed_record = get_sales_claim_record(str(record["sales_item_id"]))
+    if claimed_record is None:
+        raise RuntimeError("Unable to persist claimed record.")
+    return claimed_record
+
+
+def list_sales_draft_records() -> list[dict[str, Any]]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = spark.table(SALES_DRAFTS_TABLE).orderBy(F.col("updated_at").desc()).toPandas()
+    return [{key: _clean_value(value) for key, value in row.items()} for row in pdf.to_dict(orient="records")]
+
+
+def get_sales_draft_record(sales_item_id: str) -> dict[str, Any] | None:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = spark.table(SALES_DRAFTS_TABLE).filter(F.col("sales_item_id") == F.lit(sales_item_id)).limit(1).toPandas()
+    if pdf.empty:
+        return None
+    return {key: _clean_value(value) for key, value in pdf.iloc[0].to_dict().items()}
+
+
+def save_sales_draft_record(record: dict[str, Any]) -> dict[str, Any]:
+    ensure_control_plane_tables()
+    now = utcnow()
+    next_record = {
+        "draft_id": record["draft_id"],
+        "claim_id": record["claim_id"],
+        "cluster_id": record["cluster_id"],
+        "sales_item_id": record["sales_item_id"],
+        "draft_payload_json": record.get("draft_payload_json"),
+        "draft_status": record.get("draft_status", "drafting"),
+        "last_generated_at": record.get("last_generated_at", now),
+        "last_pushed_at": record.get("last_pushed_at"),
+        "pushed_by_name": record.get("pushed_by_name"),
+        "updated_at": now,
+    }
+    _upsert_rows(SALES_DRAFTS_TABLE, ["sales_item_id"], [next_record])
+    return next_record
+
+
+def list_sales_draft_message_records(draft_id: str) -> list[dict[str, Any]]:
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = (
+        spark.table(SALES_DRAFT_MESSAGES_TABLE)
+        .filter(F.col("draft_id") == F.lit(draft_id))
+        .orderBy(F.col("created_at").asc())
+        .toPandas()
+    )
+    return [{key: _clean_value(value) for key, value in row.items()} for row in pdf.to_dict(orient="records")]
+
+
+def save_sales_draft_message_record(record: dict[str, Any]) -> dict[str, Any]:
+    ensure_control_plane_tables()
+    next_record = {
+        "message_id": record["message_id"],
+        "draft_id": record["draft_id"],
+        "cluster_id": record["cluster_id"],
+        "sales_item_id": record["sales_item_id"],
+        "role": record.get("role", "assistant"),
+        "channel": record.get("channel", "system"),
+        "content": record.get("content", ""),
+        "created_at": record.get("created_at", utcnow()),
+    }
+    _upsert_rows(SALES_DRAFT_MESSAGES_TABLE, ["message_id"], [next_record])
+    return next_record
+
+
+# ---------------------------------------------------------------------------
+# User memory CRUD
+# ---------------------------------------------------------------------------
+
+def get_user_memory(user_id: str) -> dict[str, Any]:
+    """Return all memory entries for a user as {memory_key: parsed_json_value}."""
+    ensure_control_plane_tables()
+    spark = get_spark()
+    pdf = spark.table(USER_MEMORY_TABLE).filter(F.col("user_id") == F.lit(user_id)).toPandas()
+    result: dict[str, Any] = {}
+    for row in pdf.to_dict(orient="records"):
+        key = str(row.get("memory_key") or "")
+        raw = str(row.get("memory_value") or "{}")
+        try:
+            result[key] = json.loads(raw)
+        except Exception:
+            result[key] = raw
+    return result
+
+
+def upsert_user_memory(user_id: str, memory_key: str, value: Any) -> dict[str, Any]:
+    """Upsert a single memory entry for a user."""
+    ensure_control_plane_tables()
+    record = {
+        "user_id": user_id,
+        "memory_key": memory_key,
+        "memory_value": json.dumps(value) if not isinstance(value, str) else value,
+        "updated_at": utcnow(),
+    }
+    _upsert_rows(USER_MEMORY_TABLE, ["user_id", "memory_key"], [record])
+    return record

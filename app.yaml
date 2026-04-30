@@ -1,0 +1,69 @@
+command:
+  - npm
+  - run
+  - start
+resources:
+  - name: databricks-token
+    secret:
+      key: databricks-token
+      scope: idc-event-driven-opp
+      permission: READ
+  - name: azure-openai-key
+    secret:
+      key: azure-openai-key
+      scope: idc-event-driven-opp
+      permission: READ
+  - name: admin-api-key
+    secret:
+      key: admin-api-key
+      scope: idc-event-driven-opp
+      permission: READ
+  - name: mapbox-token
+    secret:
+      key: mapbox-token
+      scope: idc-event-driven-opp
+      permission: READ
+env:
+  # --- Core ---
+  - name: PORT
+    value: "8000"
+  - name: IDC_DB_HOST
+    value: "https://adb-3475254487784343.3.azuredatabricks.net"
+  - name: IDC_DB_AUTH_TYPE
+    value: "oauth"
+  - name: IDC_PAT_TOKEN
+    valueFrom: databricks-token
+  - name: IDC_CATALOG
+    value: "ai-leadgen"
+  - name: IDC_SCHEMA
+    value: "idc_poc"
+
+  # --- Azure OpenAI ---
+  - name: IDC_AZURE_OPENAI_ENDPOINT
+    value: "https://dev-ussc-chsy-openai.openai.azure.com/"
+  - name: IDC_AZURE_OPENAI_API_KEY
+    value: "a9cb9f7424a0407e834da50bfe36cf87"
+  - name: IDC_AZURE_OPENAI_API_VERSION
+    value: "2025-04-01-preview"
+  - name: IDC_OPENAI_MODEL
+    value: "gpt-5.4"
+  - name: IDC_CHAT_MODEL
+    value: "gpt-5.4"
+
+  # --- Knowledge Base ---
+  - name: IDC_KB_STORAGE_ROOT
+    value: "/tmp/idc-event-intelligence/knowledge_base"
+  - name: IDC_KB_MAX_RESULTS
+    value: "6"
+
+  # --- Pipeline ---
+  - name: IDC_GENERATION_RUNNER
+    value: "local"
+
+  # --- Admin ---
+  - name: IDC_ADMIN_API_KEY
+    valueFrom: admin-api-key
+
+  # --- Frontend ---
+  - name: NEXT_PUBLIC_MAPBOX_TOKEN
+    valueFrom: mapbox-token

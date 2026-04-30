@@ -1,0 +1,16 @@
+{
+  "name": "idc-event-intelligence-app",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,web \"bash ./scripts/run-api.sh dev\" \"npm run dev --workspace idc-event-intelligence-frontend\"",
+    "build": "npm run build --workspace idc-event-intelligence-frontend",
+    "start": "concurrently -k -n api,web \"bash ./scripts/run-api.sh\" \"npm run start --workspace idc-event-intelligence-frontend -- --hostname 0.0.0.0 --port ${PORT:-8000}\""
+  },
+  "dependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
