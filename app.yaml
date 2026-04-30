@@ -28,7 +28,7 @@ env:
   - name: PORT
     value: "8000"
   - name: IDC_DB_HOST
-    value: "https://adb-3475254487784343.3.azuredatabricks.net"
+    value: "https://adb-3247602525969716.16.azuredatabricks.net"
   - name: IDC_DB_AUTH_TYPE
     value: "oauth"
   - name: IDC_PAT_TOKEN
